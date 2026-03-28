@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+httpx
+scikit-learn==1.7.2
+pandas
+joblib
+google-generativeai
+python-dotenv
+pytest
