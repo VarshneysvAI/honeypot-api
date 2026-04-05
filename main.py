@@ -870,8 +870,7 @@ def select_persona_and_language(text: str) -> tuple[str, str]:
         response = gemini_model.generate_content(
             [system_prompt, f"Message: {text}"],
             generation_config=genai.types.GenerationConfig(
-                temperature=0.1,
-                max_output_tokens=100
+                temperature=0.1
             )
         )
         
@@ -1067,8 +1066,7 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
         response = chat.send_message(
             current_message,
             generation_config=genai.types.GenerationConfig(
-                temperature=0.9,
-                max_output_tokens=300
+                temperature=0.9
             ),
             safety_settings=safety_settings
         )
