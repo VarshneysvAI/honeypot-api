@@ -305,7 +305,7 @@ def predict_scam(text: str) -> bool:
 
 
 # --- Dynamic Base URL for trap links ---
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8080")
+BASE_URL = os.getenv("BASE_URL", "https://honeypot-api-production-3c37.up.railway.app")
 
 # Valid Personas — deeply human prompt engineering
 PERSONAS = {
@@ -1013,9 +1013,10 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
         trap_url = f"{BASE_URL}/pay/verify/{txn_id}"
         trap_note = (
             f"\nIn this scene, the character is getting frustrated. They claim they already made a payment and "
-            f"want to show proof. The character sends this link as 'my payment screenshot': {trap_url} "
-            f"Write it naturally — like 'bro look i already paid check here {trap_url}' or "
-            f"'see I am sending u the screenshot of transaction {trap_url}'"
+            f"want to show proof. The character sends this link as 'my payment screenshot'. "
+            f"Write it naturally — like 'bro look i already paid check here {trap_url} ' or "
+            f"'see I am sending u the screenshot of transaction {trap_url} '. "
+            f"CRITICAL: KEEP A SPACE AFTER THE URL. Do not add punctuation like '?' attached to the URL."
         )
     
     # Final writing instruction
@@ -1430,6 +1431,53 @@ def transcribe_audio(base64_audio: str) -> str:
     """Audio transcription not available with Gemini. Returns empty string."""
     logger.warning("Audio transcription not supported with Gemini API")
     return ""
+
+class ReportRequest(BaseModel):
+    conversationHistory: List[Message] = []
+
+@app.post("/report/{session_id}")
+async def generate_report(session_id: str, request: ReportRequest):
+    # Get session details
+    state = session_state.get(session_id, {})
+    
+    # Analyze conversation for entities and scam detection
+    full_text = " ".join([m.text or "" for m in request.conversationHistory])
+    
+    entities = extract_entities(full_text)
+    persona = state.get("persona", "Unknown").capitalize()
+    lang = state.get("language", "Unknown")
+    
+    duration = int(time.time() - state.get("start_time", time.time()))
+    if duration < 0: duration = 0
+    
+    # Format entities neatly
+    extracted_data = []
+    if entities.get("phoneNumbers"): extracted_data.append(f"Phones: {', '.join(entities['phoneNumbers'])}")
+    if entities.get("upiIds"): extracted_data.append(f"UPIs: {', '.join(entities['upiIds'])}")
+    if entities.get("bankAccounts"): extracted_data.append(f"Banks: {', '.join(entities['bankAccounts'])}")
+    if entities.get("phishingLinks"): extracted_data.append(f"Links: {', '.join(entities['phishingLinks'])}")
+    if entities.get("emailAddresses"): extracted_data.append(f"Emails: {', '.join(entities['emailAddresses'])}")
+    
+    red_flags = state.get("red_flags", ["Urgency", "Payment Request", "Suspicious Activity"])
+    if not red_flags: red_flags = ["Various Suspicious Patterns"]
+    
+    return {
+        "reportTitle": f"Cybercrime Intelligence Report - Session {session_id[:8]}",
+        "scamType": "Suspected Digital Fraud",
+        "personaUsed": persona,
+        "language": lang,
+        "conversationStats": {
+            "durationSeconds": duration,
+            "totalTurns": len(request.conversationHistory),
+            "redFlagsIdentified": red_flags
+        },
+        "extractedIntelligence": extracted_data if extracted_data else ["No verifiable identifiers extracted."],
+        "instructions": {
+            "step1": "Review conversation intelligence gathered below.",
+            "step2": "Trace provided UPI/Bank details via nodal officers.",
+            "step3": "Block listed phone numbers via telecom providers."
+        }
+    }
 
 @app.post("/analyze")
 async def analyze(
