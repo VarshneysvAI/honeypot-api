@@ -1115,13 +1115,30 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
             "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
         }
         
-        response = chat.send_message(
-            current_message,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.9
-            ),
-            safety_settings=safety_settings
-        )
+        # Retry with backoff for 429 rate limit errors
+        response = None
+        for attempt in range(3):
+            try:
+                response = chat.send_message(
+                    current_message,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.9
+                    ),
+                    safety_settings=safety_settings
+                )
+                break  # Success — exit retry loop
+            except Exception as rate_err:
+                err_str = str(rate_err).lower()
+                if "429" in err_str or "resource" in err_str or "quota" in err_str:
+                    wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                    logger.warning(f"Gemini rate limited (attempt {attempt+1}/3). Waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    raise  # Non-rate-limit error — don't retry
+        
+        if response is None:
+            logger.warning("All Gemini retries exhausted (429). Using fallback.")
+            return _offline_agent_reply(current_message, known_entities, persona_key, language, turn_count)
         
         # Check if response was blocked
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
@@ -1137,80 +1154,141 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
 
 
 def _offline_agent_reply(current_message: str, known_entities: Dict, persona_key: str, language: str, turn_count: int = 0) -> str:
-    """Enhanced offline fallback that asks multiple questions for maximum conversation score."""
+    """Enhanced offline fallback with varied, human-like responses per turn."""
     
     import random
     if turn_count >= 10:
         txn_id = f"TXN{random.randint(100000, 999999)}"
         trap_url = f"{BASE_URL}/pay/verify/{txn_id}"
-        return f"bro i already paid everything.. check this screenshot of my transaction: {trap_url}"
+        trap_msgs = [
+            f"bro i already paid everything.. check this screenshot of my transaction: {trap_url} ",
+            f"sir I sent the money already see proof here {trap_url} why are you asking again??",
+            f"look I'm not lying ok here is my payment receipt {trap_url} check it yourself",
+            f"ugh fine here.. i took screenshot of the transfer {trap_url} now what",
+        ]
+        return random.choice(trap_msgs)
 
     # Track what we've collected vs what we need
     missing = []
-    collected = []
+    if not known_entities.get("phoneNumbers"): missing.append("phone number")
+    if not known_entities.get("bankAccounts"): missing.append("bank account")
+    if not known_entities.get("upiIds"): missing.append("UPI ID")
+    if not known_entities.get("phishingLinks"): missing.append("payment link")
+    if not known_entities.get("emailAddresses"): missing.append("email address")
+    if not known_entities.get("ids"): missing.append("employee/case ID")
     
-    if not known_entities.get("phoneNumbers"):
-        missing.append("phone number")
-    else:
-        collected.append("phone")
-        
-    if not known_entities.get("bankAccounts"):
-        missing.append("bank account")
-    else:
-        collected.append("account")
-        
-    if not known_entities.get("upiIds"):
-        missing.append("UPI ID")
-    else:
-        collected.append("UPI")
-        
-    if not known_entities.get("phishingLinks"):
-        missing.append("payment link")
-    else:
-        collected.append("link")
-    
-    if not known_entities.get("emailAddresses"):
-        missing.append("email address")
-    else:
-        collected.append("email")
-        
-    if not known_entities.get("ids"):
-        missing.append("employee/case ID")
-    else:
-        collected.append("ID")
-    
-    # Build question list - ask for multiple things to maximize elicitation score
     ask_list = list(missing)
     if len(ask_list) < 3:
-        ask_list.extend(["verification details", "company name", "employee ID"])
+        ask_list.extend(["verification details", "company name", "employee ID", "supervisor name", "office address"])
     random.shuffle(ask_list)
     q1 = ask_list[0] if ask_list else "phone number"
     q2 = ask_list[1] if len(ask_list) > 1 else "company name"
     
-    if language == "hinglish":
-        if persona_key == "student":
-            starters = ["bhai ye sab mere sir ke upar se ja raha hai lmao 😭", "wait wait wait... mujhe step by step batao plsss.", "arey yaar mere paas balance hi nahi hai abhi..."]
-            return f"{random.choice(starters)} ek sec, aapki company konsi hai aur apna {q1.lower()} share karna. and do u have {q2.lower()}?"
-        if persona_key == "skeptic":
-            starters = ["Dekho don't try to play smart ok?", "Sir honestly this looks very suspicious.", "Please official details bhejo warna I'll ignore this."]
-            return f"{random.choice(starters)} I am not doing anything until you send me your {q1.lower()} and verifiable {q2.lower()}."
-        if persona_key == "parent":
-            starters = ["Arre ruko, bachay ro rahe hain yahan...", "Haan haan, 5 min ruko bas...", "Sorry main drive kar raha tha."]
-            return f"{random.choice(starters)} Can you quickly send your {q1.lower()}? whatsapp kar do. and also send the {q2.lower()} so i can check later."
-        starters = ["What? Beta mujhe phone theek se chalana nahi aata 😅", "Arre baba samajh nahi aaya kuch likha hua...", "Ye kya naya pareshani hai aajkal."]
-        return f"{random.choice(starters)} Zara theek se apna {q1.lower()} bhejna... aur koi {q2.lower()} hai wahan par check karne ke liye?"
-
+    msg_lower = (current_message or "").lower()
+    
+    # --- GRANDMA (Edna) ---
+    if persona_key == "grandma":
+        if language == "hinglish":
+            pool = [
+                f"Arre beta.. mujhe kuch samajh nahi aa raha.. ye {q1} kya hota hai? Zara apna naam aur {q2} bhi batao na",
+                f"Haan haan... Arjun ne bhi kuch aisa bola tha.. ek minute glasses dhundhti hoon.. waise aapka {q1} kya hai?",
+                f"Oh my god beta sacchi mein?? meri toh haath kaamp rahe hain.. aap mujhe call kar sakte ho kya? apna {q1} do na",
+                f"Beta main Moti ko khaana de rahi thi... sorry sorry.. haan toh aap bata rahe the.. aapka {q2} kya hai?",
+                f"Ye phone mein kuch aur dikha raha hai.. Arjun hota toh kar deta.. aap apna {q1} bhejo toh main usse pooch leti hoon",
+                f"Acha acha.. par mujhe ek baat batao.. aapki company ka naam kya hai? aur {q1} bhi dena zara..",
+                f"Ruko ruko.. dawai leni hai mujhe.. 2 min.. waise aapka {q2} kya bola? Mrs Sharma ko bhi batana padega ye sab",
+            ]
+        else:
+            pool = [
+                f"oh my god... is this real?? my hands are shaking.. wait let me put my glasses on.. what was your {q1} again dear?",
+                f"sorry sorry I pressed something wrong again.. Arjun told me not to press red button.. what is your name and {q2}?",
+                f"haan haan I am here only.. was feeding Moti.. so what do I need to do? can you give me your {q1} I will ask my grandson",
+                f"oh dear lord.. this is so confusing.. beta can you just call me? give me your {q1} and I will pick up",
+                f"wait wait.. Mrs Sharma next door told me about something like this.. is your {q2} genuine? what company did you say?",
+                f"I need to take my blood pressure medicine first.. one second.. ok so you were saying about {q1}? please tell me slowly",
+                f"my grandson set up this phone last Diwali and I still can't use it properly.. can you just text me your {q1} and {q2}?",
+                f"oh no oh no.. let me sit down first.. this is very serious you say.. ok tell me your {q2} and I will write it in my diary",
+            ]
+        return random.choice(pool)
+    
+    # --- STUDENT (Rohan) ---
     if persona_key == "student":
-        starters = ["wait im literally so confused right now lol 😭", "hold up... you're going too fast...", "bruh i am literally broke right now please explain."]
-        return f"{random.choice(starters)} before i do anything u mind sending ur {q1.lower()}? also whats the {q2.lower()}... just trying to be safe."
+        if language == "hinglish":
+            pool = [
+                f"bhai ye sab mere sir ke upar se ja raha hai lmao 😭 ek sec, aapki company konsi hai aur apna {q1} share karo na",
+                f"wait wait wait... mujhe step by step batao plsss.. aur haan apna {q2} bhi bhejo",
+                f"arey yaar mere paas balance hi nahi hai abhi.. kya fee deduct ho sakti hai prize se? btw whats ur {q1}?",
+                f"dude mere roommate ko bhi aisa msg aaya tha last week.. scam tha wo toh.. prove karo apna {q1} bhejo",
+                f"bro exam hai kal aur ye sab.. ok fine batao kya karna hai but pehle apna {q2} toh do",
+                f"ngl ye bohot shady lag raha hai 😬 but ok.. mere paas 43 rs hai account mein.. whats your {q1} btw?",
+            ]
+        else:
+            pool = [
+                f"wait wait wait this is real?? bro dont mess with me i literally need money so bad rn.. whats ur {q1} tho?",
+                f"ok but like how do i know ur not scamming me lol my friend lost 5k last week same way.. send me your {q2} for proof",
+                f"dude i dont have any money to pay fees.. can u deduct from the prize? also whats ur {q1}?",
+                f"sry was in class lol prof was staring at me.. ok so what do i do next? send me ur {q1} and {q2} first",
+                f"bro my roommate is looking at my screen rn and hes saying this is sus 😭 prove its legit.. whats ur {q2}?",
+                f"hmm ok interesting.. ngl im kinda interested but also scared.. send me ur {q1} so i can verify?",
+                f"wait can i ask my dad about this first?? he'll want to know your {q2} and {q1} for sure",
+                f"bruh i have literally 43 rs in my account no cap 💀 can u just send me ur {q1} ill call u back after class",
+            ]
+        return random.choice(pool)
+    
+    # --- SKEPTIC (Vinod) ---
     if persona_key == "skeptic":
-        starters = ["This sounds incredibly fake, to be honest.", "Who am I speaking to exactly?", "Im extremely vigilant about this kind of stuff so let's skip the games."]
-        return f"{random.choice(starters)} Send me official documentation immediately. Specifically your {q1.lower()} and {q2.lower()}."
+        if language == "hinglish":
+            pool = [
+                f"Dekho don't try to play smart ok? I am not doing anything until you send me your {q1} and verifiable {q2}.",
+                f"Sir honestly this looks very suspicious. Meri company ki legal team ko bhi inform karunga. Pehle apna {q1} bhejo.",
+                f"Interesting. Maine CBI helpline pe call kiya aur unhone bola aisa koi case nhi hai. Apna {q2} do for verification.",
+                f"As per protocol, I need your {q1} in writing. Also I am recording this conversation for compliance purposes.",
+                f"My colleague got a similar call last week and it was a scam. Prove me wrong — send your {q1} and {q2} right now.",
+                f"Ok noted. I need your supervisor's name and direct {q1}. I want to verify with the main branch before proceeding.",
+            ]
+        else:
+            pool = [
+                f"Sure, I'll cooperate. But first, what's your badge number? I need to log this. Also share your {q1} please.",
+                f"Right. And which branch office did you say you were calling from? I want your {q2} for verification with the main helpline.",
+                f"Interesting. My colleague got a similar call last week and it turned out to be fraud. Can you email me the case documents? What's your {q1}?",
+                f"I've been in IT for 12 years, I know how these things work. Send me your official {q1} and {q2} or this conversation is over.",
+                f"Ok I'm taking notes for my complaint to the cyber cell. What is your full name, {q1}, and {q2}? Spelling please.",
+                f"My company's security team is on standby. They want your {q1}. Also I need your direct callback number for the record.",
+                f"As per protocol I need this in writing. Forward me the official notice to my email. And what's your {q2}?",
+            ]
+        return random.choice(pool)
+    
+    # --- PARENT (Rajesh) ---
     if persona_key == "parent":
-        starters = ["Hold on a sec, the kids are literally screaming...", "I'm right in the middle of making dinner...", "Sorry what was that again?"]
-        return f"{random.choice(starters)} Quick, just give me your {q1.lower()}. and what was the {q2.lower()} again? Thanks."
-    starters = ["Oh dear, I don't really understand this technology stuff.", "My glasses are missing, can you explain this slowly?", "Who is this again?"]
-    return f"{random.choice(starters)} You'll have to bear with me... could you just send your {q1.lower()}? And do you have a {q2.lower()} for me to check? Bless you."
+        if language == "hinglish":
+            pool = [
+                f"Arre ruko, bachay ro rahe hain yahan... Can you quickly send your {q1}? whatsapp kar do.",
+                f"Haan haan, 5 min ruko bas.. NIKKI PUT THAT DOWN — sorry.. haan toh aapka {q2} kya tha?",
+                f"Sorry main bartan dho raha tha.. kya bola? {q1} chahiye? ok bhejo mujhe whatsapp pe",
+                f"Arre yaar ye Amazon delivery wala hai ya bank wala? mujhe confuse mat karo.. apna {q1} do bas",
+                f"CHHOTU STOP HITTING YOUR SISTER — sorry sorry.. haan toh batao {q2} kya hai aapka?",
+                f"One sec doorbell.. ok I'm back.. so aapka {q1} kya hai? text kar do mujhe baad mein check karunga",
+            ]
+        else:
+            pool = [
+                f"hello? yes yes I'm here.. CHHOTU STOP HITTING YOUR SISTER — sorry go on.. what was your {q1}?",
+                f"ok ok send me the link.. wait my wife is calling me.. 2 min.. can u just text me your {q1} and {q2}?",
+                f"sorry boss I forgot what u said.. something about account? which account? I have 3 banks.. just give me your {q2}",
+                f"haan I want to help but I literally cannot hear u over these kids.. can u just text me ur {q1} and I'll call back?",
+                f"wait is this about the Amazon delivery or the bank thing? I have like 5 things going on.. just send ur {q1} quickly",
+                f"hold on the baby just threw his milk on my laptop.. NIKKI CLEAN THAT UP.. ok what was your {q2} again?",
+                f"look I need to pick up my daughter from school in 10 min.. make this quick.. what's your {q1} and company name?",
+                f"sorry sorry was making chai.. ok so what do I need to do? first send me your {q2} and I'll check after dinner",
+            ]
+        return random.choice(pool)
+    
+    # DEFAULT fallback (grandma english)
+    pool = [
+        f"oh dear.. who is this? can you please share your {q1}? I need to check with my grandson first..",
+        f"I don't understand all this.. can you just give me your {q1} and {q2}? I'll ask Arjun when he comes..",
+        f"My glasses are missing again.. what did you say? something about {q1}? please send it again slowly..",
+    ]
+    return random.choice(pool)
 
 
 @app.get("/chat", response_class=HTMLResponse)
@@ -1585,21 +1663,8 @@ async def analyze(
                     "red_flags": [],
                     "elicitation_attempts": 0,
                     "turn_count": 0,
-                    "consent_given": False
                 }
                 current_state = session_state[request.sessionId]
-            # --- Privacy Consent Flow (Hackathon Wow Factor) ---
-            if not current_state.get("consent_given", False):
-                msg_clean = request.message.text.strip().upper()
-                if msg_clean == "AGREE":
-                    current_state["consent_given"] = True
-                    logger.info(f"Consent given for session {request.sessionId}")
-                    # Flow continues to generate first AI response
-                else:
-                    return {
-                        "status": "success",
-                        "reply": "🛡️ HONEYPOT PRIVACY ALERT: This interaction has been flagged as a potential scam. To protect your data and engage the scammer for research, please reply 'AGREE' to activate the AI Persona."
-                    }
             
             # Update turn count and metrics
             current_state["turn_count"] = len(request.conversationHistory) + 1
