@@ -91,11 +91,13 @@ Base = declarative_base()
 
 class GlobalIntel(Base):
     __tablename__ = "global_intel"
-    id = Column(String, primary_key=True, index=True)
+    reqno = Column(String, primary_key=True, index=True) # The unique ID for the police to search
     ip_address = Column(String)
     latitude = Column(Float)
     longitude = Column(Float)
-    scam_category = Column(String)
+    api_calls = Column(Integer, default=0) # AI compute used for this specific trap
+    fraud_type = Column(String) # e.g., "Digital Arrest", "UPI Fraud"
+    risk = Column(String) # e.g., "High", "Medium"
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 class ApiStats(Base):
@@ -164,6 +166,7 @@ def extract_entities(text: str) -> Dict[str, List[str]]:
     """Extracts comprehensive entities using regex for all intelligence types."""
     if not text:
         return {}
+    text = text[:2000] # O(1) truncation to prevent ReDoS
     
     # Email pattern - comprehensive
     email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
@@ -458,7 +461,7 @@ from fastapi.responses import HTMLResponse
 
 @app.get("/receipt/{txn_id}", response_class=HTMLResponse)
 @app.get("/pay/verify/{txn_id}", response_class=HTMLResponse)
-async def fake_receipt(txn_id: str, request: Request):
+def fake_receipt(txn_id: str, request: Request):
     forwarded_for = request.headers.get("x-forwarded-for")
     if forwarded_for:
         client_ip = forwarded_for.split(",")[0].strip()
@@ -482,11 +485,13 @@ async def fake_receipt(txn_id: str, request: Request):
     db = SessionLocal()
     try:
         new_intel = GlobalIntel(
-            id=str(uuid.uuid4()),
+            reqno=f"REQ-{uuid.uuid4().hex[:6].upper()}",
             ip_address=client_ip,
             latitude=lat,
             longitude=lon,
-            scam_category="Scam Link Clicked"
+            api_calls=1,
+            fraud_type="Scam Link Clicked",
+            risk="High"
         )
         db.add(new_intel)
         db.commit()
@@ -1089,9 +1094,12 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
     )
 
     try:
+        # Keep only the last 6 messages to preserve context but minimize token burn
+        recent_history = history[-6:] if len(history) > 6 else history
+
         # Convert messages to Gemini format (no system prompt in chat history)
         gemini_messages = []
-        for msg in history:
+        for msg in recent_history:
             role = 'user' if msg['sender'] == 'scammer' else 'model'
             gemini_messages.append({
                 'role': role,
@@ -1561,55 +1569,9 @@ def transcribe_audio(base64_audio: str) -> str:
     logger.warning("Audio transcription not supported with Gemini API")
     return ""
 
-class ReportRequest(BaseModel):
-    conversationHistory: List[Message] = []
-
-@app.post("/report/{session_id}")
-async def generate_report(session_id: str, request: ReportRequest):
-    # Get session details
-    state = session_state.get(session_id, {})
-    
-    # Analyze conversation for entities and scam detection
-    full_text = " ".join([m.text or "" for m in request.conversationHistory])
-    
-    entities = extract_entities(full_text)
-    persona = state.get("persona", "Unknown").capitalize()
-    lang = state.get("language", "Unknown")
-    
-    duration = int(time.time() - state.get("start_time", time.time()))
-    if duration < 0: duration = 0
-    
-    # Format entities neatly
-    extracted_data = []
-    if entities.get("phoneNumbers"): extracted_data.append(f"Phones: {', '.join(entities['phoneNumbers'])}")
-    if entities.get("upiIds"): extracted_data.append(f"UPIs: {', '.join(entities['upiIds'])}")
-    if entities.get("bankAccounts"): extracted_data.append(f"Banks: {', '.join(entities['bankAccounts'])}")
-    if entities.get("phishingLinks"): extracted_data.append(f"Links: {', '.join(entities['phishingLinks'])}")
-    if entities.get("emailAddresses"): extracted_data.append(f"Emails: {', '.join(entities['emailAddresses'])}")
-    
-    red_flags = state.get("red_flags", ["Urgency", "Payment Request", "Suspicious Activity"])
-    if not red_flags: red_flags = ["Various Suspicious Patterns"]
-    
-    return {
-        "reportTitle": f"Cybercrime Intelligence Report - Session {session_id[:8]}",
-        "scamType": "Suspected Digital Fraud",
-        "personaUsed": persona,
-        "language": lang,
-        "conversationStats": {
-            "durationSeconds": duration,
-            "totalTurns": len(request.conversationHistory),
-            "redFlagsIdentified": red_flags
-        },
-        "extractedIntelligence": extracted_data if extracted_data else ["No verifiable identifiers extracted."],
-        "instructions": {
-            "step1": "Review conversation intelligence gathered below.",
-            "step2": "Trace provided UPI/Bank details via nodal officers.",
-            "step3": "Block listed phone numbers via telecom providers."
-        }
-    }
 
 @app.post("/analyze")
-async def analyze(
+def analyze(
     request: AnalyzeRequest,
     background_tasks: BackgroundTasks,
     api_key: str = Depends(verify_api_key)
@@ -1781,49 +1743,32 @@ def get_dashboard_data():
     intel = db.query(GlobalIntel).all()
     stats = db.query(ApiStats).first()
     
-    heatmap_data = [{"lat": item.latitude, "lon": item.longitude, "category": item.scam_category} for item in intel]
+    # Send the complete data package for the police portal table and map
+    incident_data = []
+    for item in intel:
+        incident_data.append({
+            "reqno": item.reqno,
+            "ip": item.ip_address,
+            "lat": item.latitude,
+            "lon": item.longitude,
+            "api_calls": item.api_calls,
+            "fraud_type": item.fraud_type,
+            "risk": item.risk,
+            "timestamp": item.timestamp.isoformat() if item.timestamp else None
+        })
+        
     total_calls = stats.total_calls if stats else len(intel)
     db.close()
     
     return {
-        "heatmap_data": heatmap_data, 
-        "total_calls": total_calls,
-        "fraud_prevented_inr": total_calls * 50000
+        "incidents": incident_data, 
+        "global_metrics": {
+            "total_calls": total_calls,
+            "fraud_prevented_inr": total_calls * 50000
+        }
     }
 
 @app.get("/")
 def health():
     return {"status": "Honeycomb API Active", "version": "2.0"}
 
-@app.get("/report/{session_id}")
-async def cybercrime_report(session_id: str):
-    """Generate a cybercrime report for a given session ID."""
-    state = session_state.get(session_id)
-    if not state:
-        raise HTTPException(status_code=404, detail="Session not found. Complete a conversation first.")
-    
-    report = {
-        "reportTitle": "CYBERCRIME INCIDENT REPORT",
-        "sessionId": session_id,
-        "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
-        "scamType": "Digital Arrest / Impersonation" if state.get("persona") == "skeptic" else "Financial Fraud",
-        "personaUsed": state.get("persona", "unknown"),
-        "language": state.get("language", "unknown"),
-        "conversationStats": {
-            "totalTurns": state.get("turn_count", 0),
-            "durationSeconds": int(time.time() - state.get("start_time", time.time())),
-            "questionsAsked": state.get("questions_asked", 0),
-            "redFlagsIdentified": state.get("red_flags", []),
-            "elicitationAttempts": state.get("elicitation_attempts", 0)
-        },
-        "instructions": {
-            "step1": "Visit https://cybercrime.gov.in and click 'File a Complaint'",
-            "step2": "Select 'Financial Fraud' or 'Online Harassment' as category",
-            "step3": "Copy the Session ID and extracted intelligence into the complaint form",
-            "step4": "Attach this report as supporting evidence",
-            "step5": "Note down the complaint number for follow-up"
-        },
-        "disclaimer": "This report was auto-generated by the Honeypot API for cybercrime research purposes."
-    }
-    
-    return report
