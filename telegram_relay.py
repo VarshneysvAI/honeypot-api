@@ -7,14 +7,23 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PUT_YOUR_BOTFATHER_TOKEN_HERE")
 API_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000") + "/analyze"
 API_KEY = os.getenv("HONEYPOT_API_KEY", "honeypot_key_2026_eval")
 
+# Store conversation history per chat ID
+history_store = {}
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     chat_id = str(update.message.chat_id)
     
+    # Initialize history for new chats
+    if chat_id not in history_store:
+        history_store[chat_id] = []
+        
+    current_msg = {"sender": "scammer", "text": user_text, "timestamp": 0}
+    
     payload = {
         "sessionId": f"tg_{chat_id}",
-        "message": {"sender": "scammer", "text": user_text, "timestamp": 0},
-        "conversationHistory": [] 
+        "message": current_msg,
+        "conversationHistory": history_store[chat_id]
     }
     
     headers = {"x-api-key": API_KEY}
@@ -23,6 +32,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if response.status_code == 200:
             reply = response.json().get("reply", "System Error.")
             await update.message.reply_text(reply)
+            
+            # Save both messages to history
+            history_store[chat_id].append(current_msg)
+            history_store[chat_id].append({"sender": "agent", "text": reply, "timestamp": 0})
         else:
             await update.message.reply_text("Backend API offline.")
     except Exception as e:
