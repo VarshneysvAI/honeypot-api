@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 import httpx
 from dotenv import load_dotenv
 import joblib
-import google.generativeai as genai
+from groq import Groq
 from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
@@ -43,13 +43,9 @@ if not API_KEY:
     API_KEY = "missing"
 
 CALLBACK_URL = os.getenv("CALLBACK_URL", "https://hackathon.guvi.in/api/updateHoneyPotFinalResult")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    logger.warning("GEMINI_API_KEY not set - AI responses will use fallback mode")
-
-# Configure Gemini
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    logger.warning("GROQ_API_KEY not set - AI responses will use fallback mode")
 
 # --- Data Models (Strictly matching the requirements) ---
 
@@ -119,13 +115,13 @@ api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 # Global variables for models and clients
 scam_classifier = None
 tfidf_vectorizer = None
-gemini_model = None
+groq_client = None
 
 # --- Startup Event ---
 
 @app.on_event("startup")
 async def startup_event():
-    global scam_classifier, tfidf_vectorizer, gemini_model
+    global scam_classifier, tfidf_vectorizer, groq_client
     
     # 1. Load ML Models
     try:
@@ -143,15 +139,15 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Error loading ML models: {e}")
 
-    # 2. Initialize Gemini Model
-    if GEMINI_API_KEY:
+    # 2. Initialize Groq Client
+    if GROQ_API_KEY:
         try:
-            gemini_model = genai.GenerativeModel('gemini-2.0-flash')
-            logger.info("Gemini model initialized (gemini-2.0-flash).")
+            groq_client = Groq(api_key=GROQ_API_KEY)
+            logger.info("Groq client initialized (llama-3.3-70b-versatile).")
         except Exception as e:
-            logger.error(f"Error initializing Gemini model: {e}")
+            logger.error(f"Error initializing Groq client: {e}")
     else:
-        logger.error("GEMINI_API_KEY not set in environment.")
+        logger.error("GROQ_API_KEY not set in environment.")
 
 # --- Security ---
 
@@ -940,8 +936,8 @@ def _heuristic_persona_and_language(text: str) -> tuple[str, str]:
     return "parent", language
 
 def generate_agent_reply(history: List[Dict[str, str]], current_message: str, known_entities: Dict, persona_key: str = "grandma", language: str = "english", turn_count: int = 0) -> str:
-    """Generates a human-like response using Gemini with creative writing framing."""
-    if not gemini_model:
+    """Generates a human-like response using Groq with creative writing framing."""
+    if not groq_client:
         return _offline_agent_reply(current_message, known_entities, persona_key, language, turn_count)
 
     # Build memory context from what we know so far
@@ -1048,67 +1044,49 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
         # Keep only the last 6 messages to preserve context but minimize token burn
         recent_history = history[-6:] if len(history) > 6 else history
 
-        # Convert messages to Gemini format (no system prompt in chat history)
-        gemini_messages = []
+        # Convert messages to standard format
+        groq_messages = [{"role": "system", "content": system_prompt}]
         for msg in recent_history:
-            role = 'user' if msg['sender'] == 'scammer' else 'model'
-            gemini_messages.append({
+            role = 'user' if msg['sender'] == 'scammer' else 'assistant'
+            groq_messages.append({
                 'role': role,
-                'parts': [msg['text']]
+                'content': msg['text']
             })
         
-        # Create a model with the system instruction for this specific persona/context
-        request_model = genai.GenerativeModel(
-            'gemini-2.0-flash',
-            system_instruction=system_prompt
-        )
+        # Add the current message
+        groq_messages.append({"role": "user", "content": current_message})
         
-        # Start chat with conversation history
-        chat = request_model.start_chat(history=gemini_messages if gemini_messages else [])
-        
-        # Safety settings using string keys for maximum compatibility
-        safety_settings = {
-            "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-            "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-        }
-        
-        # Retry with backoff for 429 rate limit errors
+        # Retry with backoff for rate limit errors
         response = None
         for attempt in range(3):
             try:
-                response = chat.send_message(
-                    current_message,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=0.9
-                    ),
-                    safety_settings=safety_settings
+                response = groq_client.chat.completions.create(
+                    messages=groq_messages,
+                    model="llama-3.3-70b-versatile",
+                    temperature=0.9
                 )
                 break  # Success — exit retry loop
             except Exception as rate_err:
                 err_str = str(rate_err).lower()
-                if "429" in err_str or "resource" in err_str or "quota" in err_str:
+                if "429" in err_str or "rate limit" in err_str or "quota" in err_str:
                     wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
-                    logger.warning(f"Gemini rate limited (attempt {attempt+1}/3). Waiting {wait_time}s...")
+                    logger.warning(f"Groq rate limited (attempt {attempt+1}/3). Waiting {wait_time}s...")
                     time.sleep(wait_time)
                 else:
                     raise  # Non-rate-limit error — don't retry
         
         if response is None:
-            logger.warning("All Gemini retries exhausted (429). Using fallback.")
+            logger.warning("All Groq retries exhausted (429). Using fallback.")
             return _offline_agent_reply(current_message, known_entities, persona_key, language, turn_count)
         
-        # Check if response was blocked
-        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
-            return response.candidates[0].content.parts[0].text.strip()
+        if response.choices and response.choices[0].message and response.choices[0].message.content:
+            return response.choices[0].message.content.strip()
         else:
-            block_reason = getattr(response.candidates[0] if response.candidates else None, 'finish_reason', 'unknown')
-            logger.warning(f"Gemini blocked. Reason: {block_reason}. Using fallback.")
+            logger.warning("Groq response was empty or blocked. Using fallback.")
             return _offline_agent_reply(current_message, known_entities, persona_key, language, turn_count)
             
     except Exception as e:
-        logger.error(f"Gemini generation failed: {e}")
+        logger.error(f"Groq generation failed: {e}")
         return _offline_agent_reply(current_message, known_entities, persona_key, language, turn_count)
 
 
