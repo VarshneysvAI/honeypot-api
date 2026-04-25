@@ -899,58 +899,9 @@ async def ui_run_test(payload: UIRunRequest):
 session_state: Dict[str, Dict[str, Any]] = {}
 
 def select_persona_and_language(text: str) -> tuple[str, str]:
-    """Uses Gemini 2.5 Pro to select the best persona and language."""
-    if not gemini_model:
-        return _heuristic_persona_and_language(text)
-    
-    try:
-        system_prompt = (
-            "You are a routing engine for a honeypot AI system. "
-            "Based on the user's message, select the best persona and language.\n\n"
-            "Available Personas:\n"
-            "- 'grandma': Best for bank/KYC/utility scams. Acts confused, fails technical steps.\n"
-            "- 'student': Best for lottery/job/loan scams. Acts eager but broke.\n"
-            "- 'skeptic': Best for police/CBI/digital arrest scams. Demands authorization.\n"
-            "- 'parent': Best for general spam. Acts distracted and chaotic.\n\n"
-            "Languages:\n"
-            "- 'english': Standard English\n"
-            "- 'hinglish': Roman Hindi + English mix (e.g., 'Haan bhai', 'Arre sir')\n\n"
-            "Instructions:\n"
-            "1. Analyze the message for scam type indicators\n"
-            "2. Choose the persona that would best waste the scammer's time\n"
-            "3. Detect if message is in Hinglish (Roman Hindi) or English\n"
-            "4. Reply ONLY with format: 'persona|language'\n"
-            "Example: 'student|hinglish' or 'skeptic|english'."
-        )
-        
-        response = gemini_model.generate_content(
-            [system_prompt, f"Message: {text}"],
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.1
-            )
-        )
-        
-        result = response.text.strip().lower()
-        parts = result.split('|')
-        
-        selected_persona = "grandma"
-        selected_language = "english"
-        
-        if len(parts) >= 1:
-            for p in PERSONAS.keys():
-                if p in parts[0]:
-                    selected_persona = p
-                    break
-        
-        if len(parts) >= 2:
-            if "hinglish" in parts[1] or "hindi" in parts[1]:
-                selected_language = "hinglish"
-                
-        return selected_persona, selected_language
-
-    except Exception as e:
-        logger.error(f"Selection failed: {e}")
-        return _heuristic_persona_and_language(text)
+    """Uses heuristic keyword matching to select the best persona and language.
+    (Gemini API bypassed to save free tier quota)"""
+    return _heuristic_persona_and_language(text)
 
 
 def _heuristic_persona_and_language(text: str) -> tuple[str, str]:
