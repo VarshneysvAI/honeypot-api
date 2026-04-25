@@ -9,5 +9,6 @@ groq
 python-dotenv
 pytest
 sqlalchemy
+psycopg2-binary
 requests
 python-telegram-bot
