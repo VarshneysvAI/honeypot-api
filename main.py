@@ -144,8 +144,8 @@ async def startup_event():
     # 2. Initialize Gemini Model
     if GEMINI_API_KEY:
         try:
-            gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-            logger.info("Gemini model initialized (gemini-2.5-flash).")
+            gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+            logger.info("Gemini model initialized (gemini-2.0-flash).")
         except Exception as e:
             logger.error(f"Error initializing Gemini model: {e}")
     else:
@@ -1100,7 +1100,7 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
         
         # Create a model with the system instruction for this specific persona/context
         request_model = genai.GenerativeModel(
-            'gemini-2.5-flash',
+            'gemini-2.0-flash',
             system_instruction=system_prompt
         )
         
