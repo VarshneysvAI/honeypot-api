@@ -12,12 +12,18 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 import httpx
 from dotenv import load_dotenv
 import joblib
 import google.generativeai as genai
+from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer
+from sqlalchemy.orm import declarative_base, sessionmaker
+from datetime import datetime
+import requests
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -67,6 +73,45 @@ class AnalyzeRequest(BaseModel):
 # --- Global Components ---
 
 app = FastAPI()
+
+# --- Fix CORS ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- SQLite Database Setup ---
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./honeypot.db") 
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class GlobalIntel(Base):
+    __tablename__ = "global_intel"
+    id = Column(String, primary_key=True, index=True)
+    ip_address = Column(String)
+    latitude = Column(Float)
+    longitude = Column(Float)
+    scam_category = Column(String)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+class ApiStats(Base):
+    __tablename__ = "api_stats"
+    id = Column(Integer, primary_key=True, index=True)
+    total_calls = Column(Integer, default=0)
+
+Base.metadata.create_all(bind=engine)
+
+# Initialize the stats counter if it doesn't exist
+_init_db = SessionLocal()
+if not _init_db.query(ApiStats).first():
+    _init_db.add(ApiStats(id=1, total_calls=0))
+    _init_db.commit()
+_init_db.close()
+
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 # Global variables for models and clients
@@ -414,10 +459,6 @@ from fastapi.responses import HTMLResponse
 @app.get("/receipt/{txn_id}", response_class=HTMLResponse)
 @app.get("/pay/verify/{txn_id}", response_class=HTMLResponse)
 async def fake_receipt(txn_id: str, request: Request):
-    """
-    Fake receipt page to trap scammer IP/User-Agent.
-    """
-    # Robust IP Detection (Handles Proxies/Render/Cloudflare)
     forwarded_for = request.headers.get("x-forwarded-for")
     if forwarded_for:
         client_ip = forwarded_for.split(",")[0].strip()
@@ -426,38 +467,48 @@ async def fake_receipt(txn_id: str, request: Request):
         
     user_agent = request.headers.get("user-agent", "Unknown")
     
-    # Log the Trap Trigger
-    logger.warning(f"🚨 HONEYTRAP TRIGGERED! Scammer clicked link for {txn_id}")
-    logger.warning(f"   IP: {client_ip}")
-    logger.warning(f"   User-Agent: {user_agent}")
-    
-    # In a real scenario, we would store this in a database linked to the session_id
+    # Fetch Geo Coordinates (With Fallback to NIT Delhi/NCR roughly)
+    lat, lon = 28.6139, 77.2090 
+    try:
+        if client_ip not in ["127.0.0.1", "localhost", "::1"]:
+            geo_response = requests.get(f"http://ip-api.com/json/{client_ip}", timeout=3).json()
+            if geo_response.get("status") == "success":
+                lat = geo_response.get("lat")
+                lon = geo_response.get("lon")
+    except Exception as e:
+        logger.error(f"Geo IP failed: {e}")
+
+    # Save to SQLite for the Streamlit Heatmap
+    db = SessionLocal()
+    try:
+        new_intel = GlobalIntel(
+            id=str(uuid.uuid4()),
+            ip_address=client_ip,
+            latitude=lat,
+            longitude=lon,
+            scam_category="Scam Link Clicked"
+        )
+        db.add(new_intel)
+        db.commit()
+    except Exception as e:
+        logger.error(f"DB save failed: {e}")
+    finally:
+        db.close()
+        
+    logger.warning(f"🚨 TRAP TRIGGERED! IP: {client_ip} mapped to {lat},{lon}")
     
     html_content = f"""
     <!DOCTYPE html>
     <html>
-        <head>
-            <title>Transaction Status</title>
-            <style>
-                body {{ font-family: sans-serif; text-align: center; padding: 50px; }}
-                .loader {{ border: 16px solid #f3f3f3; border-top: 16px solid #3498db; border-radius: 50%; width: 60px; height: 60px; animation: spin 2s linear infinite; margin: auto; }}
-                @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
-                .status {{ color: #eebb00; font-size: 24px; margin-top: 20px; }}
-                .details {{ margin-top: 40px; color: #555; }}
-            </style>
-        </head>
-        <body>
-            <div class="loader"></div>
-            <h1 class="status">Processing Transaction...</h1>
-            <p>Please wait while we verify payment ID: <strong>{txn_id}</strong></p>
-            <p class="details">Do not close this window.<br>Redirecting to bank gateway...</p>
+        <head><title>Transaction Status</title></head>
+        <body style="text-align: center; padding: 50px; font-family: sans-serif;">
+            <h1 style="color: #eebb00;">Processing Transaction...</h1>
+            <p>Verifying payment ID: <strong>{txn_id}</strong></p>
             <script>
-                // Simalate a long wait then failure
                 setTimeout(() => {{
-                    document.querySelector('.status').innerText = "Transaction Timeout";
-                    document.querySelector('.status').style.color = "red";
-                    document.querySelector('.loader').style.display = "none";
-                }}, 10000);
+                    document.querySelector('h1').innerText = "Transaction Timeout";
+                    document.querySelector('h1').style.color = "red";
+                }}, 5000);
             </script>
         </body>
     </html>
@@ -1486,6 +1537,18 @@ async def analyze(
     api_key: str = Depends(verify_api_key)
 ):
     try:
+        # Increment API Call Counter
+        db = SessionLocal()
+        try:
+            stats = db.query(ApiStats).first()
+            if stats:
+                stats.total_calls += 1
+                db.commit()
+        except Exception as e:
+            logger.error(f"Failed to update stats: {e}")
+        finally:
+            db.close()
+
         # 0. Handle Audio
         original_text = request.message.text
         if request.message.audioBase64 and not original_text:
@@ -1646,6 +1709,22 @@ async def analyze(
     except Exception as e:
         logger.error(f"Error processing request: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/dashboard")
+def get_dashboard_data():
+    db = SessionLocal()
+    intel = db.query(GlobalIntel).all()
+    stats = db.query(ApiStats).first()
+    
+    heatmap_data = [{"lat": item.latitude, "lon": item.longitude, "category": item.scam_category} for item in intel]
+    total_calls = stats.total_calls if stats else len(intel)
+    db.close()
+    
+    return {
+        "heatmap_data": heatmap_data, 
+        "total_calls": total_calls,
+        "fraud_prevented_inr": total_calls * 50000
+    }
 
 @app.get("/")
 def health():

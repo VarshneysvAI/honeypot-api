@@ -8,3 +8,6 @@ joblib
 google-generativeai
 python-dotenv
 pytest
+sqlalchemy
+requests
+python-telegram-bot
